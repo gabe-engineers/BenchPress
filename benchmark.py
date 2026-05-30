@@ -7,15 +7,23 @@ from threading import Lock, Thread
 
 from faker import Faker
 from openai import AsyncOpenAI
-from transformers import AutoTokenizer
+
+from contracts import Provider
+from tokenizer import Tokenizer
 
 
 def arg_parser():
-    parser = argparse.ArgumentParser(description="VLLM benchmark harness")
+    parser = argparse.ArgumentParser(
+        description="BenchPress a light weight LLM endpoint benchmark harness"
+    )
     parser.add_argument(
         "--traffic-type", type=str, choices=["constant", "bursty"], default="constant"
     )
     parser.add_argument("--input-size-tokens", type=int, default=100)
+    parser.add_argument("--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument(
+        "--provider", type=str, choices=["vllm", "openai"], default="vllm"
+    )
     return parser.parse_args()
 
 
@@ -27,7 +35,7 @@ class Metrics:
     total_success: int
     total_errors: int
     lock: Lock
-    avg_tokens_per_sec: int
+    total_tokens: int
 
     def record_request(self):
         with self.lock:
@@ -46,15 +54,16 @@ class Metrics:
 
 
 class RequestGenerator:
-    def __init__(self):
+    def __init__(self, model: str, provider: Provider):
         api_key, base_url = environ.get("VLLM_API_KEY"), environ.get("VLLM_BASE_URL")
-        if not api_key or not base_url:
-            raise Exception("VLLM_API_KEY and VLLM_BASE_URL must be set")
+        if not api_key:
+            raise Exception("You must set VLLM_API_KEY")
+        if provider == Provider.VLLM and not base_url:
+            raise Exception("You must set VLLM_BASE_URL")
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.faker = Faker()
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-3.1-8B-Instruct"
-        )
+        self.model = model
+        self.tokenizer = Tokenizer(model, provider)
         self.lock = Lock()
         self.metrics = Metrics(
             started_at=time.time(),
@@ -63,18 +72,19 @@ class RequestGenerator:
             total_success=0,
             total_errors=0,
             lock=self.lock,
-            avg_tokens_per_sec=0,
+            total_tokens=0,
         )
         Thread(target=self.render_dashboard, daemon=True).start()
 
     async def fire_request(self, input_text: str):
         self.metrics.record_request()
         try:
-            response = await self.client.completions.create(
-                model="meta-llama/Llama-3.1-8B-Instruct", prompt=input_text
+            stream = await self.client.completions.create(
+                model=self.model, prompt=input_text, stream=True
             )
+            async for completion in stream:
+                completion.choices
             self.metrics.record_success()
-            return response
         except:
             self.metrics.record_failure()
 
@@ -84,12 +94,10 @@ class RequestGenerator:
         token_ids = []
         while len(token_ids) < num_tokens:
             new_text = self.faker.text(max_nb_chars=overshoot_chars)
-            new_tokens = self.tokenizer.encode(new_text, add_special_tokens=False)
+            new_tokens = self.tokenizer.encode(new_text)
             overshooted_text += new_text
             token_ids.extend(new_tokens)
-        tokens = self.tokenizer.encode(overshooted_text, add_special_tokens=False)[
-            :num_tokens
-        ]
+        tokens = self.tokenizer.encode(overshooted_text)[:num_tokens]
         return self.tokenizer.decode(tokens)
 
     async def generate_traffic(
@@ -142,7 +150,7 @@ class RequestGenerator:
 
 if __name__ == "__main__":
     args = arg_parser()
-    request_generator = RequestGenerator()
+    request_generator = RequestGenerator(model=args.model, provider=args.provider)
 
     if args.traffic_type == "constant":
         request_generator.generate_constant_traffic(args.input_size_chars)

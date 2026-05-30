@@ -3,8 +3,7 @@ FROM ${VLLM_IMAGE}
 
 ENV MODEL_ID=meta-llama/Llama-3.1-8B-Instruct \
     HOST=0.0.0.0 \
-    PORT=8000 \
-    VLLM_API_KEY=
+    PORT=8000
 
 EXPOSE 8000
 

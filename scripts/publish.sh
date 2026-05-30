@@ -17,10 +17,24 @@ fi
 
 REMOTE_IMAGE="${DOCKERHUB_REPO}:${IMAGE_TAG}"
 
-docker buildx build \
-  --platform "${PLATFORMS}" \
-  -t "${REMOTE_IMAGE}" \
-  --push \
-  .
+case "${PLATFORMS}" in
+  *,*)
+    docker buildx build \
+      --platform "${PLATFORMS}" \
+      --provenance=false \
+      -t "${REMOTE_IMAGE}" \
+      --push \
+      .
+    ;;
+  *)
+    docker buildx build \
+      --platform "${PLATFORMS}" \
+      --provenance=false \
+      -t "${REMOTE_IMAGE}" \
+      --load \
+      .
+    docker push "${REMOTE_IMAGE}"
+    ;;
+esac
 
 echo "Pushed ${REMOTE_IMAGE} for ${PLATFORMS}"

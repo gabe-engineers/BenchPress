@@ -83,8 +83,12 @@ IMAGE_TAG=latest ./scripts/publish.sh
 ```
 
 By default, `scripts/publish.sh` publishes `linux/amd64`, which is the safe
-default for most NVIDIA GPU hosts. Override `PLATFORMS` if you need something
-else, for example:
+default for most NVIDIA GPU hosts. For that single-platform case, the script
+now builds locally and then runs a plain `docker push`, which is often more
+reliable on Docker Hub than `buildx --push`.
+
+Override `PLATFORMS` if you need something else. Multi-platform publishes still
+use `buildx --push`, for example:
 
 ```bash
 PLATFORMS=linux/amd64,linux/arm64 IMAGE_TAG=latest ./scripts/publish.sh
