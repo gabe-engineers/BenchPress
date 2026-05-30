@@ -1,0 +1,91 @@
+# vLLM Llama 3.1 server image
+
+This directory builds a local Docker image that starts a vLLM OpenAI-compatible
+server for `meta-llama/Llama-3.1-8B-Instruct`.
+
+`Llama 3.1 7B` is not an actual Meta model name. The closest matching model is
+`meta-llama/Llama-3.1-8B-Instruct`, which is the default here.
+
+## Requirements
+
+- Docker with Compose support
+- An NVIDIA GPU that can run the official CUDA vLLM image
+- A Hugging Face token with access to the gated Llama 3.1 model
+
+## Build
+
+```bash
+docker build -t vllm-llama31-8b:local .
+```
+
+## Run with docker
+
+```bash
+export HF_TOKEN=your_hugging_face_token
+export VLLM_API_KEY=your_server_api_key
+
+docker run --rm \
+  --gpus all \
+  --ipc=host \
+  -p 8000:8000 \
+  -e HF_TOKEN \
+  -e VLLM_API_KEY \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  vllm-llama31-8b:local \
+  --max-model-len 8192
+```
+
+## Run with compose
+
+```bash
+cp .env.example .env
+# Fill in HF_TOKEN and optionally VLLM_API_KEY in .env.
+docker compose up --build
+```
+
+## Test
+
+```bash
+curl \
+  -H "Authorization: Bearer your_server_api_key" \
+  http://localhost:8000/v1/models
+```
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_server_api_key" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [
+      {"role": "user", "content": "Say hello in one sentence."}
+    ],
+    "max_completion_tokens": 64
+  }'
+```
+
+## Notes
+
+- Pass additional vLLM server args after the image name, for example
+  `--tensor-parallel-size 2`.
+- Change the served model by setting `MODEL_ID`.
+- By default, compose stores the Hugging Face cache in `./.hf-cache`.
+- If `VLLM_API_KEY` is set, the server requires `Authorization: Bearer ...`.
+
+## Publish to Docker Hub
+
+Start Docker first, then build and push:
+
+```bash
+docker login
+chmod +x scripts/publish.sh
+IMAGE_TAG=latest ./scripts/publish.sh
+```
+
+By default, `scripts/publish.sh` publishes `linux/amd64`, which is the safe
+default for most NVIDIA GPU hosts. Override `PLATFORMS` if you need something
+else, for example:
+
+```bash
+PLATFORMS=linux/amd64,linux/arm64 IMAGE_TAG=latest ./scripts/publish.sh
+```

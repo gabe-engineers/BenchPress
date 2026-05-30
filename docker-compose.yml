@@ -1,0 +1,21 @@
+services:
+  vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vllm-llama31-8b:local
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      MODEL_ID: ${MODEL_ID:-meta-llama/Llama-3.1-8B-Instruct}
+      HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      HOST: 0.0.0.0
+      PORT: 8000
+    volumes:
+      - ${HF_CACHE_DIR:-./.hf-cache}:/root/.cache/huggingface
+    ipc: host
+    gpus: all
+    command:
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-8192}"
