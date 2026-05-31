@@ -1,0 +1,13 @@
+[project]
+name = "vllm-benchmark-harness"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faker>=40.19.1",
+    "openai>=2.38.0",
+    "pyinstaller>=6.20.0",
+    "tiktoken>=0.13.0",
+    "transformers>=5.9.0",
+]
