@@ -39,6 +39,7 @@ class Metrics:
     lock: Lock
     total_tokens: int
     ttfts: List[float] = field(default_factory=list)
+    request_latencies: List[float] = field(default_factory=list)
 
     def record_request(self):
         with self.lock:
@@ -62,6 +63,10 @@ class Metrics:
     def add_ttft(self, ttft: float):
         with self.lock:
             self.ttfts.append(ttft)
+
+    def record_request_latency(self, latency: float):
+        with self.lock:
+            self.request_latencies.append(latency)
 
 
 class RequestGenerator:
@@ -97,14 +102,13 @@ class RequestGenerator:
             total_text = ""
             has_not_seen_first_token = True
             async for completion in stream:
-                chunk_text = "".join(
-                    chain.from_iterable(map(lambda c: c.text, completion.choices))
-                )
+                chunk_text = chunk_text = "".join(choice.text or "" for choice in completion.choices)
                 if chunk_text:
                     total_text += chunk_text
                 if has_not_seen_first_token and len(total_text) > 0:
                     self.metrics.add_ttft(time.perf_counter() - request_start_time)
                     has_not_seen_first_token = False
+            self.metrics.record_request_latency(time.perf_counter() - request_start_time)
             generated_tokens = self.tokenizer.encode(total_text)
             self.metrics.increment_total_tokens(len(generated_tokens))
             self.metrics.record_success()
