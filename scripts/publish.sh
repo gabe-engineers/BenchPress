@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-DOCKERHUB_REPO="ggalmeida0/vllm-llama31-8b"
+DOCKERHUB_REPO=${DOCKERHUB_REPO:-}
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 PLATFORMS="${PLATFORMS:-linux/amd64}"
 
