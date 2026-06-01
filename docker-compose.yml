@@ -18,4 +18,4 @@ services:
     gpus: all
     command:
       - --max-model-len
-      - "${MAX_MODEL_LEN:-8192}"
+      - "${MAX_MODEL_LEN:-10240}"

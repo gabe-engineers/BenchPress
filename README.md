@@ -29,10 +29,10 @@ docker run --rm \
   --ipc=host \
   -p 8000:8000 \
   -e HF_TOKEN \
+  -e MAX_MODEL_LEN=10240 \
   -e VLLM_API_KEY \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
-  vllm-llama31-8b:local \
-  --max-model-len 8192
+  vllm-llama31-8b:local
 ```
 
 ## Run with compose
@@ -45,6 +45,8 @@ docker compose up --build
 
 For Runpod, `HF_ACCESS_TOKEN` is also accepted. The container maps
 `HF_ACCESS_TOKEN` to `HF_TOKEN` at startup.
+The image defaults `MAX_MODEL_LEN` to `10240` on startup unless you pass an
+explicit `--max-model-len` argument.
 
 ## Test
 
@@ -72,6 +74,9 @@ curl http://localhost:8000/v1/chat/completions \
 - Pass additional vLLM server args after the image name, for example
   `--tensor-parallel-size 2`.
 - Change the served model by setting `MODEL_ID`.
+- Set `VLLM_BASE_URL` to your server root or `/v1`; `benchpress.py` normalizes
+  it to the OpenAI-compatible `/v1` base URL automatically.
+- Change the startup context limit by setting `MAX_MODEL_LEN`.
 - By default, compose stores the Hugging Face cache in `./.hf-cache`.
 - If `VLLM_API_KEY` is set, the server requires `Authorization: Bearer ...`.
 - For gated Hugging Face models, set either `HF_TOKEN` or `HF_ACCESS_TOKEN`.
@@ -81,9 +86,12 @@ curl http://localhost:8000/v1/chat/completions \
 When `benchpress.py` is running in an interactive terminal:
 
 - Press `p` to pause or resume traffic generation.
+- Press `q` to stop starting new requests, wait for in-flight requests to
+  finish, and exit cleanly.
 - Pausing does not cancel in-flight requests. It only stops new requests from
   being started until you resume.
 - The displayed runtime and throughput rates exclude time spent paused.
+- The dashboard shows recent success and error logs, adapting to terminal width.
 
 ## Publish to Docker Hub
 
