@@ -43,6 +43,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
+For Runpod, `HF_ACCESS_TOKEN` is also accepted. The container maps
+`HF_ACCESS_TOKEN` to `HF_TOKEN` at startup.
+
 ## Test
 
 ```bash
@@ -71,6 +74,16 @@ curl http://localhost:8000/v1/chat/completions \
 - Change the served model by setting `MODEL_ID`.
 - By default, compose stores the Hugging Face cache in `./.hf-cache`.
 - If `VLLM_API_KEY` is set, the server requires `Authorization: Bearer ...`.
+- For gated Hugging Face models, set either `HF_TOKEN` or `HF_ACCESS_TOKEN`.
+
+## Runtime controls
+
+When `benchpress.py` is running in an interactive terminal:
+
+- Press `p` to pause or resume traffic generation.
+- Pausing does not cancel in-flight requests. It only stops new requests from
+  being started until you resume.
+- The displayed runtime and throughput rates exclude time spent paused.
 
 ## Publish to Docker Hub
 

@@ -2,3 +2,4 @@
 .hf-cache/
 dist/
 build/
+__pycache__

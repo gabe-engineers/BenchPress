@@ -1,10 +1,15 @@
 import argparse
 import asyncio
+import atexit
+import shutil
+import select
+import sys
+import termios
+import textwrap
 import time
 from dataclasses import dataclass, field
-from itertools import chain
 from os import environ, system
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import List
 
 from faker import Faker
@@ -38,8 +43,11 @@ class Metrics:
     total_errors: int
     lock: Lock
     total_tokens: int
+    total_paused_duration: float = 0.0
+    paused_at: float | None = None
     ttfts: List[float] = field(default_factory=list)
     request_latencies: List[float] = field(default_factory=list)
+    recent_errors: List[str] = field(default_factory=list)
 
     def record_request(self):
         with self.lock:
@@ -51,10 +59,12 @@ class Metrics:
             self.inflight -= 1
             self.total_success += 1
 
-    def record_failure(self):
+    def record_failure(self, error_message: str):
         with self.lock:
             self.inflight -= 1
             self.total_errors += 1
+            self.recent_errors.append(error_message)
+            self.recent_errors = self.recent_errors[-6:]
 
     def increment_total_tokens(self, tokens: int):
         with self.lock:
@@ -71,9 +81,9 @@ class Metrics:
 
 class RequestGenerator:
     def __init__(self, model: str, provider: Provider):
-        api_key, base_url = environ.get("VLLM_API_KEY"), environ.get("VLLM_BASE_URL")
+        api_key, base_url = environ.get("BENCHPRESS_API_KEY"), environ.get("VLLM_BASE_URL")
         if not api_key:
-            raise Exception("You must set VLLM_API_KEY")
+            raise Exception("You must set BENCHPRESS_API_KEY")
         if provider == Provider.VLLM and not base_url:
             raise Exception("You must set VLLM_BASE_URL")
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -81,6 +91,11 @@ class RequestGenerator:
         self.model = model
         self.tokenizer = Tokenizer(model, provider)
         self.lock = Lock()
+        self.run_event = Event()
+        self.run_event.set()
+        self.controls_enabled = False
+        self.stdin_fd = None
+        self.original_terminal_settings = None
         self.metrics = Metrics(
             started_at=time.perf_counter(),
             inflight=0,
@@ -90,7 +105,88 @@ class RequestGenerator:
             lock=self.lock,
             total_tokens=0,
         )
+        self.enable_controls()
         Thread(target=self.render_dashboard, daemon=True).start()
+
+    def enable_controls(self):
+        if not sys.stdin.isatty():
+            return
+
+        try:
+            self.stdin_fd = sys.stdin.fileno()
+            self.original_terminal_settings = termios.tcgetattr(self.stdin_fd)
+            updated_terminal_settings = termios.tcgetattr(self.stdin_fd)
+            updated_terminal_settings[3] &= ~(termios.ICANON | termios.ECHO)
+            updated_terminal_settings[6][termios.VMIN] = 1
+            updated_terminal_settings[6][termios.VTIME] = 0
+            termios.tcsetattr(
+                self.stdin_fd, termios.TCSANOW, updated_terminal_settings
+            )
+        except (OSError, termios.error):
+            self.stdin_fd = None
+            self.original_terminal_settings = None
+            return
+
+        self.controls_enabled = True
+        atexit.register(self.restore_terminal)
+        Thread(target=self.listen_for_controls, daemon=True).start()
+
+    def restore_terminal(self):
+        if self.stdin_fd is None or self.original_terminal_settings is None:
+            return
+
+        try:
+            termios.tcsetattr(
+                self.stdin_fd, termios.TCSANOW, self.original_terminal_settings
+            )
+        except (OSError, termios.error):
+            pass
+        finally:
+            self.stdin_fd = None
+            self.original_terminal_settings = None
+
+    def listen_for_controls(self):
+        while True:
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            except (OSError, ValueError):
+                return
+
+            if not ready:
+                continue
+
+            try:
+                command = sys.stdin.read(1).lower()
+            except OSError:
+                return
+
+            if command == "p":
+                self.toggle_pause()
+
+    def toggle_pause(self):
+        with self.lock:
+            now = time.perf_counter()
+            if self.run_event.is_set():
+                self.run_event.clear()
+                self.metrics.paused_at = now
+            else:
+                if self.metrics.paused_at is not None:
+                    self.metrics.total_paused_duration += now - self.metrics.paused_at
+                    self.metrics.paused_at = None
+                self.run_event.set()
+
+    async def wait_for_resume(self):
+        while not self.run_event.is_set():
+            await asyncio.sleep(0.1)
+
+    async def sleep_with_pause(self, duration_secs: float):
+        remaining = duration_secs
+        while remaining > 0:
+            await self.wait_for_resume()
+            sleep_duration = min(0.1, remaining)
+            sleep_started_at = time.perf_counter()
+            await asyncio.sleep(sleep_duration)
+            remaining -= time.perf_counter() - sleep_started_at
 
     async def fire_request(self, input_text: str):
         self.metrics.record_request()
@@ -102,7 +198,7 @@ class RequestGenerator:
             total_text = ""
             has_not_seen_first_token = True
             async for completion in stream:
-                chunk_text = chunk_text = "".join(choice.text or "" for choice in completion.choices)
+                chunk_text = "".join(choice.text or "" for choice in completion.choices)
                 if chunk_text:
                     total_text += chunk_text
                 if has_not_seen_first_token and len(total_text) > 0:
@@ -112,8 +208,10 @@ class RequestGenerator:
             generated_tokens = self.tokenizer.encode(total_text)
             self.metrics.increment_total_tokens(len(generated_tokens))
             self.metrics.record_success()
-        except:
-            self.metrics.record_failure()
+        except Exception as exc:
+            self.metrics.record_failure(
+                f"[{time.strftime('%H:%M:%S')}] {type(exc).__name__}: {exc}"
+            )
 
     def generate_tokens(self, num_tokens: int) -> str:
         overshoot_chars = num_tokens * 10
@@ -131,23 +229,56 @@ class RequestGenerator:
         self, input_num_tokens: int, max_burst: int, cool_down_secs: int
     ):
         while True:
-            requests = [
-                self.fire_request(self.generate_tokens(input_num_tokens))
-                for _ in range(max_burst)
-            ]
-            await asyncio.gather(*requests)
-            await asyncio.sleep(cool_down_secs)
+            await self.wait_for_resume()
+            requests = []
+            for _ in range(max_burst):
+                if not self.run_event.is_set():
+                    break
+                requests.append(
+                    asyncio.create_task(
+                        self.fire_request(self.generate_tokens(input_num_tokens))
+                    )
+                )
+                await asyncio.sleep(0)
+
+            if requests:
+                await asyncio.gather(*requests)
+
+            await self.sleep_with_pause(cool_down_secs)
 
     def generate_bursty_traffic(self, input_num_tokens: int):
-        asyncio.run(self.generate_traffic(input_num_tokens, 10, 10))
+        try:
+            asyncio.run(self.generate_traffic(input_num_tokens, 10, 10))
+        finally:
+            self.restore_terminal()
 
     def generate_constant_traffic(self, input_num_tokens: int):
-        asyncio.run(self.generate_traffic(input_num_tokens, 1, 1))
+        try:
+            asyncio.run(self.generate_traffic(input_num_tokens, 1, 1))
+        finally:
+            self.restore_terminal()
+
+    def render_box(
+        self, title: str, body_lines: List[str], width: int, min_body_lines: int = 0
+    ) -> List[str]:
+        inner_width = width - 2
+        padded_lines = body_lines + [""] * max(0, min_body_lines - len(body_lines))
+        return [
+            f"┌{'─' * inner_width}┐",
+            f"│{title:^{inner_width}}│",
+            f"├{'─' * inner_width}┤",
+            *[f"│{line[:inner_width]:<{inner_width}}│" for line in padded_lines],
+            f"└{'─' * inner_width}┘",
+        ]
 
     def render_dashboard(self):
         while True:
             with self.lock:
-                runtime = time.perf_counter() - self.metrics.started_at
+                now = time.perf_counter()
+                paused_duration = self.metrics.total_paused_duration
+                if self.metrics.paused_at is not None:
+                    paused_duration += now - self.metrics.paused_at
+                runtime = max(0.0, now - self.metrics.started_at - paused_duration)
 
                 error_rate = (
                     self.metrics.total_errors / self.metrics.total_requests * 100
@@ -155,7 +286,7 @@ class RequestGenerator:
                     else 0.0
                 )
 
-                tokens_per_sec = self.metrics.total_tokens / runtime
+                tokens_per_sec = self.metrics.total_tokens / runtime if runtime else 0.0
 
                 avg_ttft = (
                     sum(self.metrics.ttfts) / len(self.metrics.ttfts)
@@ -165,23 +296,83 @@ class RequestGenerator:
 
                 system("clear")
 
-                print(
-                    f"""
-            ┌──────────────────────────────────────────────┐
-            │ BenchPress Performance Harness               │
-            ├──────────────────────────────────────────────┤
-            │ Runtime            {runtime:<25}│
-            ├──────────────────────────────────────────────┤
-            │ In-flight          {self.metrics.inflight:<25}│
-            │ Total Requests     {self.metrics.total_requests:<25}│
-            │ Tokens/s       {tokens_per_sec:<25}│
-            │ Avg TTFT (client observed)     {avg_ttft:<25}│
-            │ Successes          {self.metrics.total_success:<25}│
-            │ Errors             {self.metrics.total_errors:<25}│
-            │ Error Rate         {f"{error_rate:.2f}%":<25}│
-            └──────────────────────────────────────────────┘
-            """.strip()
+                rows = [
+                    ("Status", "Paused" if not self.run_event.is_set() else "Running"),
+                    ("Runtime", f"{runtime:.2f}s"),
+                    ("In-flight", str(self.metrics.inflight)),
+                    ("Total Requests", str(self.metrics.total_requests)),
+                    ("Tokens/s", f"{tokens_per_sec:.2f}"),
+                    ("Avg TTFT", f"{avg_ttft:.3f}s"),
+                    ("Successes", str(self.metrics.total_success)),
+                    ("Errors", str(self.metrics.total_errors)),
+                    ("Error Rate", f"{error_rate:.2f}%"),
+                ]
+                metric_body_lines = [
+                    f" {label:<18} {value:>24}" for label, value in rows
+                ]
+                metric_body_lines.extend(
+                    [
+                        "",
+                        " [p] pause/resume"
+                        if self.controls_enabled
+                        else " Controls unavailable (non-interactive)",
+                    ]
                 )
+
+                terminal_width = shutil.get_terminal_size((120, 20)).columns
+                metrics_width = 46
+                gap_width = 2
+                min_error_width = 38
+
+                error_width = min(72, terminal_width - metrics_width - gap_width)
+                can_render_side_by_side = error_width >= min_error_width
+
+                if can_render_side_by_side:
+                    error_body_lines: List[str] = []
+                    error_text_width = error_width - 4
+                    for error_message in self.metrics.recent_errors:
+                        wrapped_lines = textwrap.wrap(
+                            error_message,
+                            width=error_text_width,
+                            break_long_words=False,
+                            break_on_hyphens=False,
+                        ) or [""]
+                        error_body_lines.append(f" {wrapped_lines[0]}")
+                        error_body_lines.extend(f" {line}" for line in wrapped_lines[1:])
+                        error_body_lines.append("")
+                    if error_body_lines:
+                        error_body_lines.pop()
+                    else:
+                        error_body_lines = [" No errors recorded."]
+
+                    min_body_lines = max(
+                        len(metric_body_lines), len(error_body_lines)
+                    )
+                    metrics_box = self.render_box(
+                        "BenchPress Performance Harness",
+                        metric_body_lines,
+                        metrics_width,
+                        min_body_lines=min_body_lines,
+                    )
+                    errors_box = self.render_box(
+                        "Recent Errors",
+                        error_body_lines,
+                        error_width,
+                        min_body_lines=min_body_lines,
+                    )
+                    print(
+                        "\n".join(
+                            f"{left}{' ' * gap_width}{right}"
+                            for left, right in zip(metrics_box, errors_box)
+                        )
+                    )
+                else:
+                    metrics_box = self.render_box(
+                        "BenchPress Performance Harness",
+                        metric_body_lines,
+                        metrics_width,
+                    )
+                    print("\n".join(metrics_box))
             time.sleep(1)
 
 
