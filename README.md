@@ -117,10 +117,23 @@ dashboard metrics.
 Run a multi-step experiment from YAML:
 
 ```bash
+uv run benchpress-experiment
+```
+
+When `benchpress.experiment.yaml` exists in the current directory, it is used
+automatically. To override that default, pass an explicit path:
+
+```bash
 uv run benchpress-experiment examples/cache-toggle.experiment.yaml
 ```
 
 Equivalent direct invocation:
+
+```bash
+.venv/bin/python benchpress.py experiment
+```
+
+Or with an explicit config path:
 
 ```bash
 .venv/bin/python benchpress.py experiment examples/cache-toggle.experiment.yaml
@@ -154,12 +167,42 @@ runs:
   - name: cache-on
 ```
 
+Experiment runs can also execute setup commands before the benchmark starts and
+override the target endpoint for that run:
+
+```yaml
+name: kv-cache-comparison
+
+runs:
+  - name: no-cache
+    setup:
+      commands:
+        - pkill -f "python server.py" || true
+        - python server.py --kv-cache=false --port=8000 &
+        - sleep 5
+    target:
+      url: http://localhost:8000/v1/chat/completions
+
+  - name: with-cache
+    setup:
+      commands:
+        - pkill -f "python server.py" || true
+        - python server.py --kv-cache=true --port=8000 &
+        - sleep 5
+    target:
+      url: http://localhost:8000/v1/chat/completions
+```
+
+`BENCHPRESS_API_KEY` is still required for experiment runs; when your local
+server ignores auth, any non-empty dummy value works.
+
 Supported experiment fields:
 
 - `name`: optional experiment name, used in the default comparison filename
 - `runs_dir`: optional output directory for the run CSV files
 - `defaults`: optional shared run settings for `provider`, `model`,
   `traffic_type`, `traffic_volume`, and `input_size_tokens`
+- `defaults.target.url`: optional shared OpenAI-compatible endpoint override
 - `prompt_between_runs`: optional global pause between runs; set it to `true`
   for the default prompt, `false` to disable, or a custom string prompt
 - `comparison.enabled`: optional boolean, defaults to `true`
@@ -168,12 +211,17 @@ Supported experiment fields:
 - `comparison.output`: optional output image path
 - `comparison.title`: optional chart title
 - `runs`: required list of runs; each run needs a unique `name` and can override
-  `provider`, `model`, `traffic_type`, `traffic_volume`, `input_size_tokens`, and
-  `prompt_after_run`
+  `provider`, `model`, `traffic_type`, `traffic_volume`, `input_size_tokens`,
+  `prompt_after_run`, and `target.url`
+- `runs[].setup.commands`: optional shell commands to run before the benchmark
+  for that run. These execute from the experiment YAML directory in a dedicated
+  shell session that stays alive until the run finishes, so background commands
+  like `python server.py &` keep serving traffic during the benchmark.
 
 `prompt_after_run` uses the same values as `prompt_between_runs`: `true`,
 `false`, or a custom string. Relative paths in the YAML are resolved from the
-YAML file's directory.
+YAML file's directory. `target.url` overrides `VLLM_BASE_URL` for the run when
+provided.
 
 Compare saved runs:
 

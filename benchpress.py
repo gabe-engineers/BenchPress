@@ -3,9 +3,12 @@ import asyncio
 import atexit
 import csv
 import re
+import shlex
 import shutil
 import select
+import subprocess
 import sys
+import tempfile
 import termios
 import textwrap
 import time
@@ -43,6 +46,7 @@ DEFAULT_INPUT_SIZE_TOKENS = 100
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_PROVIDER = Provider.VLLM.value
 DEFAULT_RUNS_DIR = Path("runs")
+DEFAULT_EXPERIMENT_CONFIG_PATH = Path("benchpress.experiment.yaml")
 DEFAULT_EXPERIMENT_PAUSE_PROMPT = (
     "Run complete. Press any key to start the next run."
 )
@@ -130,8 +134,13 @@ def build_experiment_parser(prog: str = "experiment") -> argparse.ArgumentParser
     )
     parser.add_argument(
         "config",
+        nargs="?",
         type=Path,
-        help="Path to an experiment YAML config file.",
+        default=None,
+        help=(
+            "Path to an experiment YAML config file. Defaults to "
+            "benchpress.experiment.yaml in the current directory."
+        ),
     )
     return parser
 
@@ -244,6 +253,21 @@ def load_experiment_dependencies():
     return yaml
 
 
+def resolve_experiment_config_path(config_path: Path | None) -> Path:
+    if config_path is None:
+        if DEFAULT_EXPERIMENT_CONFIG_PATH.is_file():
+            return DEFAULT_EXPERIMENT_CONFIG_PATH
+        raise FileNotFoundError(
+            "No experiment config path was provided and "
+            f"{DEFAULT_EXPERIMENT_CONFIG_PATH} was not found in the current directory"
+        )
+
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Experiment config file was not found: {config_path}")
+
+    return config_path
+
+
 @dataclass(frozen=True)
 class ExperimentRun:
     name: str
@@ -252,6 +276,8 @@ class ExperimentRun:
     traffic_type: str
     traffic_volume: int
     input_size_tokens: int
+    setup_commands: List[str]
+    target_url: str | None
     prompt_after_run: str | None
 
 
@@ -312,12 +338,29 @@ def parse_required_string(value: object, *, field_name: str) -> str:
     return value.strip()
 
 
+def parse_optional_string(value: object, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return parse_required_string(value, field_name=field_name)
+
+
 def parse_experiment_mapping(value: object, *, field_name: str) -> dict[str, Any]:
     if value is None:
         return {}
     if not isinstance(value, dict):
         raise ValueError(f"{field_name} must be a mapping")
     return value
+
+
+def parse_string_list(value: object, *, field_name: str) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    return [
+        parse_required_string(item, field_name=f"{field_name}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 
 def parse_experiment_run(
@@ -364,6 +407,22 @@ def parse_experiment_run(
         field_name=f"runs[{run_index}].input_size_tokens",
     )
 
+    setup_data = parse_experiment_mapping(
+        run_data.get("setup"), field_name=f"runs[{run_index}].setup"
+    )
+    setup_commands = parse_string_list(
+        setup_data.get("commands"),
+        field_name=f"runs[{run_index}].setup.commands",
+    )
+
+    target_data = parse_experiment_mapping(
+        run_data.get("target"), field_name=f"runs[{run_index}].target"
+    )
+    target_url = parse_optional_string(
+        target_data.get("url", defaults.get("target_url")),
+        field_name=f"runs[{run_index}].target.url",
+    )
+
     if "prompt_after_run" in run_data:
         prompt_after_run = parse_prompt_setting(
             run_data["prompt_after_run"],
@@ -380,6 +439,8 @@ def parse_experiment_run(
         traffic_type=traffic_type,
         traffic_volume=traffic_volume,
         input_size_tokens=input_size_tokens,
+        setup_commands=setup_commands,
+        target_url=target_url,
         prompt_after_run=prompt_after_run,
     )
 
@@ -426,6 +487,13 @@ def load_experiment_config(config_path: Path) -> ExperimentConfig:
             "input_size_tokens", DEFAULT_INPUT_SIZE_TOKENS
         ),
     }
+    defaults_target = parse_experiment_mapping(
+        defaults.get("target"), field_name="defaults.target"
+    )
+    merged_defaults["target_url"] = parse_optional_string(
+        defaults_target.get("url"),
+        field_name="defaults.target.url",
+    )
 
     runs_data = raw_config.get("runs")
     if not isinstance(runs_data, list) or not runs_data:
@@ -518,6 +586,73 @@ def wait_for_keypress(prompt: str):
             except (OSError, termios.error):
                 pass
         print()
+
+
+class ExperimentSetupShell:
+    def __init__(self, *, working_directory: Path):
+        self.process = subprocess.Popen(
+            ["/bin/zsh"],
+            cwd=working_directory,
+            stdin=subprocess.PIPE,
+            text=True,
+        )
+        if self.process.stdin is None:
+            raise RuntimeError("Failed to open experiment setup shell stdin")
+
+    def run_command(self, command: str) -> None:
+        if self.process.stdin is None:
+            raise RuntimeError("Experiment setup shell stdin is unavailable")
+
+        with tempfile.NamedTemporaryFile(
+            prefix="benchpress-setup-", suffix=".status", delete=False
+        ) as status_file:
+            status_path = Path(status_file.name)
+        status_path.unlink()
+
+        self.process.stdin.write(f"{command}\n")
+        self.process.stdin.write(
+            f"printf '%s' $? > {shlex.quote(str(status_path))}\n"
+        )
+        self.process.stdin.flush()
+
+        while True:
+            if status_path.exists():
+                try:
+                    exit_code = int(status_path.read_text().strip() or "1")
+                finally:
+                    status_path.unlink(missing_ok=True)
+                if exit_code != 0:
+                    raise RuntimeError(
+                        f"Experiment setup command failed with exit code {exit_code}: "
+                        f"{command}"
+                    )
+                return
+
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    "Experiment setup shell exited before the command completed: "
+                    f"{command}"
+                )
+            time.sleep(0.05)
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.write("exit\n")
+                self.process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            self.process.stdin.close()
+
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
 
 
 def compare_run_files(
@@ -751,16 +886,19 @@ class RequestGenerator:
         self,
         model: str,
         provider: Provider,
+        base_url: str | None = None,
         run_name: str | None = None,
         run_output_dir: Path = DEFAULT_RUNS_DIR,
     ):
-        api_key, base_url = environ.get("BENCHPRESS_API_KEY"), environ.get("VLLM_BASE_URL")
+        api_key = environ.get("BENCHPRESS_API_KEY")
         if not api_key:
             raise Exception("You must set BENCHPRESS_API_KEY")
-        if provider == Provider.VLLM and not base_url:
-            raise Exception("You must set VLLM_BASE_URL")
         if provider == Provider.VLLM:
-            base_url = self.normalize_vllm_base_url(base_url)
+            base_url = base_url or environ.get("VLLM_BASE_URL")
+            if not base_url:
+                raise Exception("You must set VLLM_BASE_URL or target.url")
+        if base_url:
+            base_url = self.normalize_base_url(base_url, provider)
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.faker = Faker()
         self.model = model
@@ -805,10 +943,12 @@ class RequestGenerator:
         return run_output_dir / f"{sanitize_run_name(run_name)}.csv"
 
     @staticmethod
-    def normalize_vllm_base_url(base_url: str) -> str:
+    def normalize_base_url(base_url: str, provider: Provider) -> str:
         parsed_url = urlsplit(base_url)
         normalized_path = parsed_url.path.rstrip("/")
-        if not normalized_path.endswith("/v1"):
+        if normalized_path.endswith("/chat/completions"):
+            normalized_path = normalized_path[: -len("/chat/completions")]
+        if provider == Provider.VLLM and not normalized_path.endswith("/v1"):
             normalized_path = f"{normalized_path}/v1" if normalized_path else "/v1"
         return urlunsplit(
             (
@@ -1388,12 +1528,14 @@ def run_benchmark(
     traffic_type: str,
     traffic_volume: int,
     input_size_tokens: int,
+    base_url: str | None = None,
     run_name: str | None,
     run_output_dir: Path = DEFAULT_RUNS_DIR,
 ) -> RequestGenerator:
     request_generator = RequestGenerator(
         model=model,
         provider=provider,
+        base_url=base_url,
         run_name=run_name,
         run_output_dir=run_output_dir,
     )
@@ -1417,15 +1559,36 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult:
             f"({format_traffic_profile(run.traffic_type, run.traffic_volume)}, "
             f"{run.input_size_tokens} toks)"
         )
-        request_generator = run_benchmark(
-            provider=run.provider,
-            model=run.model,
-            traffic_type=run.traffic_type,
-            traffic_volume=run.traffic_volume,
-            input_size_tokens=run.input_size_tokens,
-            run_name=run.name,
-            run_output_dir=config.runs_dir,
-        )
+        setup_shell: ExperimentSetupShell | None = None
+        try:
+            if run.setup_commands:
+                print(
+                    f"Running {len(run.setup_commands)} setup command(s) for "
+                    f"{run.name} in {config.config_path.parent}"
+                )
+                setup_shell = ExperimentSetupShell(
+                    working_directory=config.config_path.parent
+                )
+                for command_index, command in enumerate(run.setup_commands, start=1):
+                    print(
+                        f"[setup {run.name} {command_index}/{len(run.setup_commands)}] "
+                        f"{command}"
+                    )
+                    setup_shell.run_command(command)
+
+            request_generator = run_benchmark(
+                provider=run.provider,
+                model=run.model,
+                traffic_type=run.traffic_type,
+                traffic_volume=run.traffic_volume,
+                input_size_tokens=run.input_size_tokens,
+                base_url=run.target_url,
+                run_name=run.name,
+                run_output_dir=config.runs_dir,
+            )
+        finally:
+            if setup_shell is not None:
+                setup_shell.close()
 
         if request_generator.run_output_path is None or not request_generator.run_file_written:
             raise RuntimeError(f"Experiment run {run.name!r} did not produce a run CSV")
@@ -1455,7 +1618,13 @@ def experiment_cli(argv: Sequence[str] | None = None) -> int:
     args = build_experiment_parser().parse_args(
         list(argv) if argv is not None else None
     )
-    result = run_experiment(load_experiment_config(args.config))
+    try:
+        config_path = resolve_experiment_config_path(args.config)
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    result = run_experiment(load_experiment_config(config_path))
     if result.comparison_output_path is not None:
         print(f"Wrote experiment comparison plot to {result.comparison_output_path}")
     return 0
@@ -1464,7 +1633,13 @@ def experiment_cli(argv: Sequence[str] | None = None) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "experiment":
-        result = run_experiment(load_experiment_config(args.config))
+        try:
+            config_path = resolve_experiment_config_path(args.config)
+        except FileNotFoundError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+
+        result = run_experiment(load_experiment_config(config_path))
         if result.comparison_output_path is not None:
             print(f"Wrote experiment comparison plot to {result.comparison_output_path}")
         return 0
