@@ -1,0 +1,25 @@
+name: cache-toggle
+runs_dir: ../runs/cache-toggle
+
+defaults:
+  provider: vllm
+  model: meta-llama/Llama-3.1-8B-Instruct
+  traffic_type: constant
+  traffic_volume: 1
+  input_size_tokens: 100
+
+prompt_between_runs: false
+
+comparison:
+  title: Cache Toggle Comparison
+  output: ../runs/cache-toggle/cache-toggle-comparison.png
+  metrics:
+    - tokens_per_second
+    - avg_ttft_seconds
+    - avg_request_latency_seconds
+    - error_rate_percent
+
+runs:
+  - name: cache-off
+    prompt_after_run: Enable caching, then press any key to start the next run.
+  - name: cache-on

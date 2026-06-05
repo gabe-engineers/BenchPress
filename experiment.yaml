@@ -1,0 +1,34 @@
+name: cache-toggle
+runs_dir: ../runs/cache-toggle
+
+defaults:
+  provider: vllm
+  model: openai-community/gpt2
+  traffic_type: constant
+  traffic_volume: 3
+
+  prompt_between_run: true
+
+comparison:
+  title: Cache Toggle Comparison
+  output: ../runs/cache-toggle/cache-toggle-comparison.png
+  metrics:
+    - tokens_per_second
+    - avg_ttft_seconds
+    - avg_request_latency_seconds
+    - error_rate_percent
+
+runs:
+  - name: cache-off-input-100
+    input_size_tokens: 100
+  - name: cache-off-input-500
+    input_size_tokens: 500
+  - name: cache-off-input-900
+    prompt_after_run: Enable caching, then press any key to start the next run.
+    input_size_tokens: 900
+  - name: cache-on-input-100
+    input_size_tokens: 100
+  - name: cache-on-input-500
+    input_size_tokens: 500
+  - name: cache-on-input-900
+    input_size_tokens: 900

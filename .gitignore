@@ -3,3 +3,7 @@
 dist/
 build/
 __pycache__
+*.egg-info/
+runs/
+.DS_Store
+runs*
