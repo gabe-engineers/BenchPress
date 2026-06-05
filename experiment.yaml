@@ -19,16 +19,13 @@ comparison:
     - error_rate_percent
 
 runs:
-  - name: cache-off-input-100
-    input_size_tokens: 100
-  - name: cache-off-input-500
+  - name: hf-cache-off-input-500
     input_size_tokens: 500
-  - name: cache-off-input-900
     prompt_after_run: Enable caching, then press any key to start the next run.
-    input_size_tokens: 900
-  - name: cache-on-input-100
-    input_size_tokens: 100
-  - name: cache-on-input-500
+  - name: hf-cache-on-input-500
     input_size_tokens: 500
-  - name: cache-on-input-900
-    input_size_tokens: 900
+  - name: my-cache-off
+    input_size_tokens: 500
+    prompt_after_run: Enable caching, then press any key to start the next run.
+  - name: my-cache-on
+    input_size_tokens: 500
